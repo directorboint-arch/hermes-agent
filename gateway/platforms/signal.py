@@ -922,12 +922,33 @@ class SignalAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        """Send an audio file as a Signal attachment.
+        """Send an audio file as a Signal voice note.
 
-        Signal does not distinguish voice messages from file attachments at
-        the API level, so this routes through the same RPC send path.
+        Uses the voiceNote flag so Signal renders it as an inline voice
+        message rather than a plain file attachment.
         """
-        return await self._send_attachment(chat_id, audio_path, "Audio", caption)
+        await self._stop_typing_indicator(chat_id)
+        try:
+            file_size = Path(audio_path).stat().st_size
+        except FileNotFoundError:
+            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+        if file_size > SIGNAL_MAX_ATTACHMENT_SIZE:
+            return SendResult(success=False, error=f"Audio too large ({file_size} bytes)")
+        params: Dict[str, Any] = {
+            "account": self.account,
+            "message": caption or "",
+            "attachments": [audio_path],
+            "voiceNote": True,
+        }
+        if chat_id.startswith("group:"):
+            params["groupId"] = chat_id[6:]
+        else:
+            params["recipient"] = [await self._resolve_recipient(chat_id)]
+        result = await self._rpc("send", params)
+        if result is not None:
+            self._track_sent_timestamp(result)
+            return SendResult(success=True)
+        return SendResult(success=False, error="RPC send voice failed")
 
     async def send_video(
         self,
