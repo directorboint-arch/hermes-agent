@@ -91,13 +91,14 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("searxng", "parallel", "firecrawl", "tavily", "exa"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
+        ("searxng", _has_env("SEARXNG_URL")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -112,6 +113,8 @@ def _get_backend() -> str:
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend == "searxng":
+        return _has_env("SEARXNG_URL")
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -121,6 +124,42 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
     return False
+
+
+# ─── SearXNG Local Search ──────────────────────────────────────────────────────
+def _searxng_search(query: str, limit: int) -> dict:
+    """Search via a local SearXNG instance.
+
+    Reads ``SEARXNG_URL`` from the environment (e.g. http://localhost:4000).
+    Zero API key required — fully self-hosted and private.
+    """
+    url = os.getenv("SEARXNG_URL", "").strip().rstrip("/")
+    if not url:
+        raise RuntimeError("SEARXNG_URL is not set in the environment")
+
+    import requests as _req
+
+    resp = _req.get(
+        f"{url}/search",
+        params={"q": query, "format": "json"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("results", [])
+    logger.info("SearXNG found %d results for: '%s'", len(results), query)
+
+    web = []
+    for i, r in enumerate(results[:limit]):
+        web.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "description": r.get("content", ""),
+            "position": i + 1,
+        })
+
+    return {"success": True, "data": {"web": web}}
+
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -1095,6 +1134,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+        if backend == "searxng":
+            response_data = _searxng_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
